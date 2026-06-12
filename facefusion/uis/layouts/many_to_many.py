@@ -1,13 +1,13 @@
 import os
 import tempfile
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import gradio
+import numpy
 
 import facefusion.processors.modules.face_enhancer.core as face_enhancer
 import facefusion.processors.modules.face_swapper.core as face_swapper
 from facefusion import face_classifier, face_detector, face_landmarker, face_masker, face_recognizer, state_manager
-from facefusion.common_helper import get_first
 from facefusion.face_analyser import get_average_face, get_many_faces
 from facefusion.face_selector import sort_faces_by_order
 from facefusion.face_store import clear_static_faces
@@ -20,9 +20,9 @@ from facefusion.vision import read_static_image, write_image
 # A simplified, dedicated page for swapping MANY faces onto MANY faces.
 #
 # Flow:
-#   1. Drop source photo(s) -> every face found is shown as a removable chip.
-#   2. Drop the target photo -> every face found is shown as a removable chip.
-#   3. Delete any face you do not want on either side.
+#   1. Drop source photo(s) -> every face found is shown with a Remove button.
+#   2. Drop the target photo -> every face found is shown with a Remove button.
+#   3. Remove any face you don't want on either side.
 #   4. Click "Match all faces" -> source face #1 -> target face #1, #2 -> #2 ...
 #      (both sides ordered left-to-right) then swap and clean up.
 #
@@ -42,14 +42,11 @@ MANY_TO_MANY_CSS =\
 .m2m-hero p { opacity: 0.7; margin: 0.35rem 0 0; font-size: 0.95rem; }
 .m2m-swap-button button { font-size: 1.05rem !important; padding: 1rem !important; }
 .m2m-status { min-height: 1.5rem; }
+.m2m-face-card img { border-radius: 0.375rem; }
 '''
 
 SOURCE_FILE : Optional[gradio.File] = None
-SOURCE_GALLERY : Optional[gradio.Gallery] = None
-SOURCE_REMOVE_BUTTON : Optional[gradio.Button] = None
 TARGET_FILE : Optional[gradio.Image] = None
-TARGET_GALLERY : Optional[gradio.Gallery] = None
-TARGET_REMOVE_BUTTON : Optional[gradio.Button] = None
 ENHANCE_CHECKBOX : Optional[gradio.Checkbox] = None
 MATCH_BUTTON : Optional[gradio.Button] = None
 CLEAR_BUTTON : Optional[gradio.Button] = None
@@ -59,8 +56,6 @@ STATUS_MARKDOWN : Optional[gradio.Markdown] = None
 SOURCE_FACES_STATE : Optional[gradio.State] = None
 TARGET_FACES_STATE : Optional[gradio.State] = None
 TARGET_FRAME_STATE : Optional[gradio.State] = None
-SOURCE_SELECTED_STATE : Optional[gradio.State] = None
-TARGET_SELECTED_STATE : Optional[gradio.State] = None
 
 
 def pre_check() -> bool:
@@ -68,19 +63,15 @@ def pre_check() -> bool:
 
 
 def render() -> gradio.Blocks:
-	global SOURCE_FILE, SOURCE_GALLERY, SOURCE_REMOVE_BUTTON
-	global TARGET_FILE, TARGET_GALLERY, TARGET_REMOVE_BUTTON
-	global ENHANCE_CHECKBOX, MATCH_BUTTON, CLEAR_BUTTON, RESULT_IMAGE, STATUS_MARKDOWN
-	global SOURCE_FACES_STATE, TARGET_FACES_STATE, TARGET_FRAME_STATE, SOURCE_SELECTED_STATE, TARGET_SELECTED_STATE
+	global SOURCE_FILE, TARGET_FILE, ENHANCE_CHECKBOX, MATCH_BUTTON, CLEAR_BUTTON, RESULT_IMAGE, STATUS_MARKDOWN
+	global SOURCE_FACES_STATE, TARGET_FACES_STATE, TARGET_FRAME_STATE
 
 	with gradio.Blocks() as layout:
-		gradio.HTML('<style>' + MANY_TO_MANY_CSS + '</style><div class="m2m-hero"><h1>Multi-Face Swap</h1><p>Drop your faces and a group photo, remove the ones you don\'t want, then match everyone in one click.</p></div>')
+		gradio.HTML('<style>' + MANY_TO_MANY_CSS + '</style><div class="m2m-hero"><h1>Multi-Face Swap</h1><p>Drop your faces and a target photo, remove the ones you don\'t want, then match everyone in one click.</p></div>')
 
 		SOURCE_FACES_STATE = gradio.State([])
 		TARGET_FACES_STATE = gradio.State([])
 		TARGET_FRAME_STATE = gradio.State(None)
-		SOURCE_SELECTED_STATE = gradio.State(None)
-		TARGET_SELECTED_STATE = gradio.State(None)
 
 		with gradio.Row():
 			with gradio.Column():
@@ -89,37 +80,13 @@ def render() -> gradio.Blocks:
 					file_count = 'multiple',
 					file_types = [ 'image' ]
 				)
-				SOURCE_GALLERY = gradio.Gallery(
-					label = 'Detected source faces  —  click one, then Remove',
-					columns = 5,
-					height = 150,
-					object_fit = 'cover',
-					allow_preview = False,
-					visible = False
-				)
-				SOURCE_REMOVE_BUTTON = gradio.Button(
-					value = 'Remove selected source face',
-					size = 'sm',
-					visible = False
-				)
+				render_face_cards(SOURCE_FACES_STATE, 'Source', remove_source_face_at)
 			with gradio.Column():
 				TARGET_FILE = gradio.Image(
 					label = '2.  Target photo  —  the faces to replace',
 					type = 'filepath'
 				)
-				TARGET_GALLERY = gradio.Gallery(
-					label = 'Detected target faces  —  click one, then Remove',
-					columns = 5,
-					height = 150,
-					object_fit = 'cover',
-					allow_preview = False,
-					visible = False
-				)
-				TARGET_REMOVE_BUTTON = gradio.Button(
-					value = 'Remove selected target face',
-					size = 'sm',
-					visible = False
-				)
+				render_face_cards(TARGET_FACES_STATE, 'Face', remove_target_face_at)
 
 		ENHANCE_CHECKBOX = gradio.Checkbox(
 			label = 'Enhance faces after swapping (GFPGAN) — recommended',
@@ -147,18 +114,34 @@ def render() -> gradio.Blocks:
 	return layout
 
 
+def render_face_cards(faces_state : gradio.State, label_prefix : str, remover_factory : Callable[[int], Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]]) -> None:
+	@gradio.render(inputs = faces_state)
+	def render_cards(face_items : List[Dict[str, Any]]) -> None:
+		if not face_items:
+			gradio.Markdown('*No ' + label_prefix.lower() + ' faces yet.*')
+			return
+
+		with gradio.Row():
+			for index, face_item in enumerate(face_items):
+				with gradio.Column(min_width = 116):
+					gradio.Image(
+						value = face_item.get('crop'),
+						height = 116,
+						show_label = False,
+						interactive = False,
+						show_download_button = False,
+						show_fullscreen_button = False,
+						elem_classes = 'm2m-face-card'
+					)
+					remove_button = gradio.Button(value = '✕ ' + label_prefix + ' ' + str(index + 1), size = 'sm')
+					remove_button.click(remover_factory(index), inputs = faces_state, outputs = faces_state)
+
+
 def listen() -> None:
-	SOURCE_FILE.change(detect_source_faces, inputs = SOURCE_FILE, outputs = [ SOURCE_FACES_STATE, SOURCE_GALLERY, SOURCE_REMOVE_BUTTON, STATUS_MARKDOWN ])
-	TARGET_FILE.change(detect_target_faces, inputs = TARGET_FILE, outputs = [ TARGET_FACES_STATE, TARGET_FRAME_STATE, TARGET_GALLERY, TARGET_REMOVE_BUTTON, STATUS_MARKDOWN ])
-
-	SOURCE_GALLERY.select(store_selection, outputs = SOURCE_SELECTED_STATE)
-	TARGET_GALLERY.select(store_selection, outputs = TARGET_SELECTED_STATE)
-
-	SOURCE_REMOVE_BUTTON.click(remove_source_face, inputs = [ SOURCE_FACES_STATE, SOURCE_SELECTED_STATE ], outputs = [ SOURCE_FACES_STATE, SOURCE_GALLERY, SOURCE_SELECTED_STATE ])
-	TARGET_REMOVE_BUTTON.click(remove_target_face, inputs = [ TARGET_FACES_STATE, TARGET_SELECTED_STATE ], outputs = [ TARGET_FACES_STATE, TARGET_GALLERY, TARGET_SELECTED_STATE ])
-
+	SOURCE_FILE.change(detect_source_faces, inputs = SOURCE_FILE, outputs = [ SOURCE_FACES_STATE, STATUS_MARKDOWN ])
+	TARGET_FILE.change(detect_target_faces, inputs = TARGET_FILE, outputs = [ TARGET_FACES_STATE, TARGET_FRAME_STATE, STATUS_MARKDOWN ])
 	MATCH_BUTTON.click(match_and_swap, inputs = [ SOURCE_FACES_STATE, TARGET_FACES_STATE, TARGET_FRAME_STATE, ENHANCE_CHECKBOX ], outputs = [ RESULT_IMAGE, STATUS_MARKDOWN ])
-	CLEAR_BUTTON.click(clear, outputs = [ SOURCE_FILE, TARGET_FILE, SOURCE_GALLERY, SOURCE_REMOVE_BUTTON, TARGET_GALLERY, TARGET_REMOVE_BUTTON, RESULT_IMAGE, STATUS_MARKDOWN, SOURCE_FACES_STATE, TARGET_FACES_STATE, TARGET_FRAME_STATE, SOURCE_SELECTED_STATE, TARGET_SELECTED_STATE ])
+	CLEAR_BUTTON.click(clear, outputs = [ SOURCE_FILE, TARGET_FILE, RESULT_IMAGE, STATUS_MARKDOWN, SOURCE_FACES_STATE, TARGET_FACES_STATE, TARGET_FRAME_STATE ])
 
 
 def run(ui : gradio.Blocks) -> None:
@@ -175,11 +158,7 @@ def crop_face(vision_frame : VisionFrame, face : Face) -> VisionFrame:
 	end_x = int(min(frame_width, end_x + pad_x))
 	end_y = int(min(frame_height, end_y + pad_y))
 	crop_vision_frame = vision_frame[start_y:end_y, start_x:end_x]
-	return crop_vision_frame[:, :, ::-1]
-
-
-def build_gallery(face_items : List[Dict[str, Any]], label_prefix : str) -> List[Tuple[VisionFrame, str]]:
-	return [ (face_item.get('crop'), label_prefix + ' ' + str(index + 1)) for index, face_item in enumerate(face_items) ]
+	return numpy.ascontiguousarray(crop_vision_frame[:, :, ::-1])
 
 
 def detect_faces_in_frame(vision_frame : VisionFrame) -> List[Dict[str, Any]]:
@@ -188,11 +167,11 @@ def detect_faces_in_frame(vision_frame : VisionFrame) -> List[Dict[str, Any]]:
 	return [ { 'face': face, 'crop': crop_face(vision_frame, face) } for face in faces ]
 
 
-def detect_source_faces(files : Optional[List[File]]) -> Tuple[List[Dict[str, Any]], gradio.Gallery, gradio.Button, gradio.Markdown]:
+def detect_source_faces(files : Optional[List[File]]) -> Tuple[List[Dict[str, Any]], gradio.Markdown]:
 	source_paths = filter_image_paths([ file.name for file in files ]) if files else []
 
 	if not source_paths:
-		return [], gradio.Gallery(value = None, visible = False), gradio.Button(visible = False), gradio.Markdown(value = 'Drop source faces and a target photo to begin.')
+		return [], gradio.Markdown(value = 'Drop source faces and a target photo to begin.')
 
 	face_items = []
 	for source_path in source_paths:
@@ -202,39 +181,33 @@ def detect_source_faces(files : Optional[List[File]]) -> Tuple[List[Dict[str, An
 			face_items.append(face_item)
 
 	if not face_items:
-		return [], gradio.Gallery(value = None, visible = False), gradio.Button(visible = False), gradio.Markdown(value = '❌  No face found in the source photos. Use clearer portraits.')
-	return face_items, gradio.Gallery(value = build_gallery(face_items, 'Source'), visible = True), gradio.Button(visible = True), gradio.Markdown(value = '✅  Found ' + str(len(face_items)) + ' source face' + ('s' if len(face_items) != 1 else '') + '. Remove any you don\'t want.')
+		return [], gradio.Markdown(value = '❌  No face found in the source photos. Use clearer portraits.')
+	return face_items, gradio.Markdown(value = '✅  Found ' + str(len(face_items)) + ' source face' + ('s' if len(face_items) != 1 else '') + '. Remove any you don\'t want.')
 
 
-def detect_target_faces(target_path : Optional[str]) -> Tuple[List[Dict[str, Any]], Optional[VisionFrame], gradio.Gallery, gradio.Button, gradio.Markdown]:
+def detect_target_faces(target_path : Optional[str]) -> Tuple[List[Dict[str, Any]], Optional[VisionFrame], gradio.Markdown]:
 	if not is_image(target_path):
-		return [], None, gradio.Gallery(value = None, visible = False), gradio.Button(visible = False), gradio.Markdown(value = 'Drop source faces and a target photo to begin.')
+		return [], None, gradio.Markdown(value = 'Drop source faces and a target photo to begin.')
 
 	target_vision_frame = read_static_image(target_path)
 	face_items = detect_faces_in_frame(target_vision_frame)
 
 	if not face_items:
-		return [], None, gradio.Gallery(value = None, visible = False), gradio.Button(visible = False), gradio.Markdown(value = '❌  No face found in the target photo.')
-	return face_items, target_vision_frame, gradio.Gallery(value = build_gallery(face_items, 'Face'), visible = True), gradio.Button(visible = True), gradio.Markdown(value = '✅  Found ' + str(len(face_items)) + ' target face' + ('s' if len(face_items) != 1 else '') + '. Remove any you don\'t want.')
+		return [], None, gradio.Markdown(value = '❌  No face found in the target photo.')
+	return face_items, target_vision_frame, gradio.Markdown(value = '✅  Found ' + str(len(face_items)) + ' target face' + ('s' if len(face_items) != 1 else '') + '. Remove any you don\'t want.')
 
 
-def store_selection(event : gradio.SelectData) -> int:
-	return event.index
+def remove_source_face_at(target_index : int) -> Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]:
+	return lambda face_items : remove_face_item(face_items, target_index)
 
 
-def remove_source_face(face_items : List[Dict[str, Any]], selected_index : Optional[int]) -> Tuple[List[Dict[str, Any]], gradio.Gallery, None]:
-	face_items = remove_face_item(face_items, selected_index)
-	return face_items, gradio.Gallery(value = build_gallery(face_items, 'Source'), visible = bool(face_items)), None
+def remove_target_face_at(target_index : int) -> Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]:
+	return lambda face_items : remove_face_item(face_items, target_index)
 
 
-def remove_target_face(face_items : List[Dict[str, Any]], selected_index : Optional[int]) -> Tuple[List[Dict[str, Any]], gradio.Gallery, None]:
-	face_items = remove_face_item(face_items, selected_index)
-	return face_items, gradio.Gallery(value = build_gallery(face_items, 'Face'), visible = bool(face_items)), None
-
-
-def remove_face_item(face_items : List[Dict[str, Any]], selected_index : Optional[int]) -> List[Dict[str, Any]]:
-	if face_items and selected_index is not None and 0 <= selected_index < len(face_items):
-		return [ face_item for index, face_item in enumerate(face_items) if index != selected_index ]
+def remove_face_item(face_items : List[Dict[str, Any]], target_index : int) -> List[Dict[str, Any]]:
+	if face_items and 0 <= target_index < len(face_items):
+		return [ face_item for index, face_item in enumerate(face_items) if index != target_index ]
 	return face_items
 
 
@@ -335,15 +308,9 @@ def clear() -> Tuple[Any, ...]:
 	return (
 		gradio.File(value = None),
 		gradio.Image(value = None),
-		gradio.Gallery(value = None, visible = False),
-		gradio.Button(visible = False),
-		gradio.Gallery(value = None, visible = False),
-		gradio.Button(visible = False),
 		gradio.Image(value = None),
 		gradio.Markdown(value = 'Drop source faces and a target photo to begin.'),
 		[],
 		[],
-		None,
-		None,
 		None
 	)
