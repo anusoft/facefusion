@@ -7,6 +7,7 @@ import cv2
 import gradio
 import numpy
 
+import facefusion.choices as facefusion_choices
 import facefusion.processors.modules.face_enhancer.core as face_enhancer
 import facefusion.processors.modules.face_swapper.core as face_swapper
 from facefusion import face_classifier, face_detector, face_landmarker, face_masker, face_recognizer, state_manager
@@ -20,29 +21,37 @@ from facefusion.vision import count_video_frame_total, detect_video_fps, read_st
 
 #
 # A simplified, dedicated page for swapping MANY faces onto MANY faces, on
-# images AND videos.
+# images AND videos, with an Advanced panel for model tuning.
 #
-# Flow:
-#   1. Drop source photo(s) -> each detected face becomes "Source 1, 2, 3 ...".
-#   2. Drop a target image OR video. For a video, scrub to a frame where every
-#      face you care about is clearly visible -> that frame is used for matching.
-#   3. For every target face, pick which source replaces it.
-#   4. Click "Swap faces". For video, each face is tracked across all frames by
-#      face recognition, so the right source stays on the right person.
-#
-# Quality choices (research backed): inswapper_128 gives the best identity
-# fidelity, and a GFPGAN face-enhancer pass removes the low-resolution "swapped"
-# look. 'Wide' uses hififace for forehead + jaw coverage (hair is never changed).
+# Quality / robustness defaults (research backed):
+#  - retinaface detector: strong on profile / side views and occlusion.
+#  - inswapper_128 swapper: best identity fidelity; GFPGAN cleans up the result.
+#  - 'Wide' area uses hififace for forehead + jaw coverage (hair never changes).
 #
 
 SWAP_AREA_SET =\
 {
-	'face': { 'model': 'inswapper_128', 'pixel_boost': '256x256', 'mask_types': [ 'box', 'occlusion' ] },
-	'wide': { 'model': 'hififace_unofficial_256', 'pixel_boost': '256x256', 'mask_types': [ 'box' ] }
+	'face': { 'model': 'inswapper_128', 'mask_types': [ 'box', 'occlusion' ] },
+	'wide': { 'model': 'hififace_unofficial_256', 'mask_types': [ 'box' ] }
 }
 FACE_ENHANCER_MODEL = 'gfpgan_1.4'
 KEEP_ORIGINAL = -1
 MATCH_DISTANCE = 0.6  # how close a frame face must be to a reference identity
+
+# Advanced defaults
+DEFAULT_DETECTOR_MODEL = 'retinaface'
+DEFAULT_DETECTOR_SIZE = '640x640'
+DEFAULT_DETECTOR_SCORE = 0.5
+DEFAULT_DETECTOR_ANGLES = [ 0 ]
+DEFAULT_PIXEL_BOOST = '256x256'
+DEFAULT_SWAPPER_WEIGHT = 0.5
+DEFAULT_MASK_BLUR = 0.3
+DEFAULT_ENHANCER_BLEND = 80
+
+DETECTOR_MODEL_CHOICES = [ ('RetinaFace — best for side / profile views', 'retinaface'), ('SCRFD — strong on hard poses', 'scrfd'), ('YOLO Face — fast', 'yolo_face'), ('YuNet — light', 'yunet'), ('Many — combine all (slowest, best recall)', 'many') ]
+DETECTOR_SIZE_CHOICES = [ '640x640', '512x512', '480x480', '320x320', '160x160' ]
+DETECTOR_ANGLE_CHOICES = [ ('0°', 0), ('90°', 90), ('180°', 180), ('270°', 270) ]
+PIXEL_BOOST_CHOICES = [ '256x256', '512x512', '768x768' ]
 
 MANY_TO_MANY_CSS =\
 '''
@@ -66,6 +75,15 @@ RESULT_IMAGE : Optional[gradio.Image] = None
 RESULT_VIDEO : Optional[gradio.Video] = None
 STATUS_MARKDOWN : Optional[gradio.Markdown] = None
 
+DETECTOR_MODEL_DROPDOWN : Optional[gradio.Dropdown] = None
+DETECTOR_SIZE_DROPDOWN : Optional[gradio.Dropdown] = None
+DETECTOR_SCORE_SLIDER : Optional[gradio.Slider] = None
+DETECTOR_ANGLES_CHECKBOX : Optional[gradio.CheckboxGroup] = None
+PIXEL_BOOST_DROPDOWN : Optional[gradio.Dropdown] = None
+SWAPPER_WEIGHT_SLIDER : Optional[gradio.Slider] = None
+MASK_BLUR_SLIDER : Optional[gradio.Slider] = None
+ENHANCER_BLEND_SLIDER : Optional[gradio.Slider] = None
+
 SOURCE_FACES_STATE : Optional[gradio.State] = None
 TARGET_FACES_STATE : Optional[gradio.State] = None
 TARGET_FRAME_STATE : Optional[gradio.State] = None
@@ -81,6 +99,8 @@ def pre_check() -> bool:
 def render() -> gradio.Blocks:
 	global SOURCE_FILE, TARGET_FILE, FRAME_SLIDER, FRAME_PREVIEW, SWAP_AREA_RADIO, ENHANCE_CHECKBOX
 	global SWAP_BUTTON, CLEAR_BUTTON, RESULT_IMAGE, RESULT_VIDEO, STATUS_MARKDOWN
+	global DETECTOR_MODEL_DROPDOWN, DETECTOR_SIZE_DROPDOWN, DETECTOR_SCORE_SLIDER, DETECTOR_ANGLES_CHECKBOX
+	global PIXEL_BOOST_DROPDOWN, SWAPPER_WEIGHT_SLIDER, MASK_BLUR_SLIDER, ENHANCER_BLEND_SLIDER
 	global SOURCE_FACES_STATE, TARGET_FACES_STATE, TARGET_FRAME_STATE, TARGET_PATH_STATE, TARGET_IS_VIDEO_STATE, REFERENCE_FRAME_STATE
 
 	with gradio.Blocks() as layout:
@@ -95,70 +115,42 @@ def render() -> gradio.Blocks:
 
 		with gradio.Row():
 			with gradio.Column():
-				SOURCE_FILE = gradio.File(
-					label = '1.  Source faces  —  the new identities',
-					file_count = 'multiple',
-					file_types = [ 'image' ]
-				)
+				SOURCE_FILE = gradio.File(label = '1.  Source faces  —  the new identities', file_count = 'multiple', file_types = [ 'image' ])
 				render_source_palette()
 			with gradio.Column():
-				TARGET_FILE = gradio.File(
-					label = '2.  Target image or video  —  the faces to replace',
-					file_count = 'single',
-					file_types = [ 'image', 'video' ]
-				)
-				FRAME_PREVIEW = gradio.Image(
-					label = 'Matching frame',
-					interactive = False,
-					visible = False
-				)
-				FRAME_SLIDER = gradio.Slider(
-					label = 'Scrub to a frame where every face is clearly visible',
-					minimum = 1,
-					maximum = 1,
-					step = 1,
-					value = 1,
-					visible = False
-				)
+				TARGET_FILE = gradio.File(label = '2.  Target image or video  —  the faces to replace', file_count = 'single', file_types = [ 'image', 'video' ])
+				FRAME_PREVIEW = gradio.Image(label = 'Matching frame', interactive = False, visible = False)
+				FRAME_SLIDER = gradio.Slider(label = 'Scrub to a frame where every face is clearly visible', minimum = 1, maximum = 1, step = 1, value = 1, visible = False)
 
 		gradio.Markdown('### 3.  Match each target face to a source')
 		render_target_matcher()
 
 		with gradio.Row():
-			SWAP_AREA_RADIO = gradio.Radio(
-				label = 'Swap area  (hair is always kept from the target)',
-				choices = [ ('Face — sharpest match', 'face'), ('Wide — forehead + jaw', 'wide') ],
-				value = 'face'
-			)
-			ENHANCE_CHECKBOX = gradio.Checkbox(
-				label = 'Enhance faces (GFPGAN) — recommended',
-				value = True
-			)
+			SWAP_AREA_RADIO = gradio.Radio(label = 'Swap area  (hair is always kept from the target)', choices = [ ('Face — sharpest match', 'face'), ('Wide — forehead + jaw', 'wide') ], value = 'face')
+			ENHANCE_CHECKBOX = gradio.Checkbox(label = 'Enhance faces (GFPGAN) — recommended', value = True)
+
+		with gradio.Accordion('Advanced settings', open = False):
+			gradio.Markdown('**Face detection** — switch model / size / sensitivity for hard angles. RetinaFace and SCRFD handle side views best; add rotation angles for tilted faces.')
+			with gradio.Row():
+				DETECTOR_MODEL_DROPDOWN = gradio.Dropdown(label = 'Detector model', choices = DETECTOR_MODEL_CHOICES, value = DEFAULT_DETECTOR_MODEL)
+				DETECTOR_SIZE_DROPDOWN = gradio.Dropdown(label = 'Detector size (larger = more faces, slower)', choices = DETECTOR_SIZE_CHOICES, value = DEFAULT_DETECTOR_SIZE)
+			with gradio.Row():
+				DETECTOR_SCORE_SLIDER = gradio.Slider(label = 'Detector score (lower = catch more faces)', minimum = 0.0, maximum = 1.0, step = 0.05, value = DEFAULT_DETECTOR_SCORE)
+				DETECTOR_ANGLES_CHECKBOX = gradio.CheckboxGroup(label = 'Detection angles (for rotated faces)', choices = DETECTOR_ANGLE_CHOICES, value = DEFAULT_DETECTOR_ANGLES)
+			gradio.Markdown('**Swapping & blending**')
+			with gradio.Row():
+				PIXEL_BOOST_DROPDOWN = gradio.Dropdown(label = 'Pixel boost (sharper, slower)', choices = PIXEL_BOOST_CHOICES, value = DEFAULT_PIXEL_BOOST)
+				SWAPPER_WEIGHT_SLIDER = gradio.Slider(label = 'Identity strength', minimum = 0.0, maximum = 1.0, step = 0.05, value = DEFAULT_SWAPPER_WEIGHT)
+			with gradio.Row():
+				MASK_BLUR_SLIDER = gradio.Slider(label = 'Edge blur', minimum = 0.0, maximum = 1.0, step = 0.05, value = DEFAULT_MASK_BLUR)
+				ENHANCER_BLEND_SLIDER = gradio.Slider(label = 'Enhancer strength', minimum = 0, maximum = 100, step = 1, value = DEFAULT_ENHANCER_BLEND)
+
 		with gradio.Row():
-			SWAP_BUTTON = gradio.Button(
-				value = 'Swap faces',
-				variant = 'primary',
-				size = 'lg',
-				elem_classes = 'm2m-swap-button'
-			)
-			CLEAR_BUTTON = gradio.Button(
-				value = 'Clear',
-				size = 'lg'
-			)
-		STATUS_MARKDOWN = gradio.Markdown(
-			value = 'Add source faces and a target image or video to begin.',
-			elem_classes = 'm2m-status'
-		)
-		RESULT_IMAGE = gradio.Image(
-			label = 'Result',
-			interactive = False,
-			visible = False
-		)
-		RESULT_VIDEO = gradio.Video(
-			label = 'Result',
-			interactive = False,
-			visible = False
-		)
+			SWAP_BUTTON = gradio.Button(value = 'Swap faces', variant = 'primary', size = 'lg', elem_classes = 'm2m-swap-button')
+			CLEAR_BUTTON = gradio.Button(value = 'Clear', size = 'lg')
+		STATUS_MARKDOWN = gradio.Markdown(value = 'Add source faces and a target image or video to begin.', elem_classes = 'm2m-status')
+		RESULT_IMAGE = gradio.Image(label = 'Result', interactive = False, visible = False)
+		RESULT_VIDEO = gradio.Video(label = 'Result', interactive = False, visible = False)
 	return layout
 
 
@@ -198,16 +190,35 @@ def render_target_matcher() -> None:
 					source_dropdown.change(assign_source_at(target_index), inputs = [ source_dropdown, TARGET_FACES_STATE ], outputs = TARGET_FACES_STATE)
 
 
+def detector_inputs() -> List[gradio.Component]:
+	return [ DETECTOR_MODEL_DROPDOWN, DETECTOR_SIZE_DROPDOWN, DETECTOR_SCORE_SLIDER, DETECTOR_ANGLES_CHECKBOX ]
+
+
 def listen() -> None:
-	SOURCE_FILE.change(detect_source_faces, inputs = SOURCE_FILE, outputs = [ SOURCE_FACES_STATE, STATUS_MARKDOWN ])
-	TARGET_FILE.change(detect_target, inputs = TARGET_FILE, outputs = [ TARGET_FACES_STATE, TARGET_FRAME_STATE, TARGET_PATH_STATE, TARGET_IS_VIDEO_STATE, REFERENCE_FRAME_STATE, FRAME_SLIDER, FRAME_PREVIEW, STATUS_MARKDOWN ])
-	FRAME_SLIDER.release(select_frame, inputs = [ FRAME_SLIDER, TARGET_PATH_STATE ], outputs = [ TARGET_FACES_STATE, TARGET_FRAME_STATE, REFERENCE_FRAME_STATE, FRAME_PREVIEW, STATUS_MARKDOWN ])
-	SWAP_BUTTON.click(swap, inputs = [ SOURCE_FACES_STATE, TARGET_FACES_STATE, TARGET_FRAME_STATE, TARGET_PATH_STATE, TARGET_IS_VIDEO_STATE, REFERENCE_FRAME_STATE, SWAP_AREA_RADIO, ENHANCE_CHECKBOX ], outputs = [ RESULT_IMAGE, RESULT_VIDEO, STATUS_MARKDOWN ])
+	SOURCE_FILE.change(detect_source_faces, inputs = [ SOURCE_FILE ] + detector_inputs(), outputs = [ SOURCE_FACES_STATE, STATUS_MARKDOWN ])
+	TARGET_FILE.change(detect_target, inputs = [ TARGET_FILE ] + detector_inputs(), outputs = [ TARGET_FACES_STATE, TARGET_FRAME_STATE, TARGET_PATH_STATE, TARGET_IS_VIDEO_STATE, REFERENCE_FRAME_STATE, FRAME_SLIDER, FRAME_PREVIEW, STATUS_MARKDOWN ])
+	FRAME_SLIDER.release(select_frame, inputs = [ FRAME_SLIDER, TARGET_PATH_STATE ] + detector_inputs(), outputs = [ TARGET_FACES_STATE, TARGET_FRAME_STATE, REFERENCE_FRAME_STATE, FRAME_PREVIEW, STATUS_MARKDOWN ])
+	SWAP_BUTTON.click(swap, inputs = [ SOURCE_FACES_STATE, TARGET_FACES_STATE, TARGET_FRAME_STATE, TARGET_PATH_STATE, TARGET_IS_VIDEO_STATE, REFERENCE_FRAME_STATE, SWAP_AREA_RADIO, ENHANCE_CHECKBOX ] + detector_inputs() + [ PIXEL_BOOST_DROPDOWN, SWAPPER_WEIGHT_SLIDER, MASK_BLUR_SLIDER, ENHANCER_BLEND_SLIDER ], outputs = [ RESULT_IMAGE, RESULT_VIDEO, STATUS_MARKDOWN ])
 	CLEAR_BUTTON.click(clear, outputs = [ SOURCE_FILE, TARGET_FILE, FRAME_SLIDER, FRAME_PREVIEW, RESULT_IMAGE, RESULT_VIDEO, STATUS_MARKDOWN, SOURCE_FACES_STATE, TARGET_FACES_STATE, TARGET_FRAME_STATE, TARGET_PATH_STATE, TARGET_IS_VIDEO_STATE, REFERENCE_FRAME_STATE ])
 
 
 def run(ui : gradio.Blocks) -> None:
 	ui.launch(favicon_path = 'facefusion.ico', inbrowser = state_manager.get_item('open_browser'))
+
+
+def resolve_detector_size(detector_model : str, detector_size : str) -> str:
+	sizes = facefusion_choices.face_detector_set.get(detector_model, [ DEFAULT_DETECTOR_SIZE ])
+	if detector_size in sizes:
+		return detector_size
+	return sizes[-1]
+
+
+def apply_detector_settings(detector_model : str, detector_size : str, detector_score : float, detector_angles : List[int]) -> None:
+	state_manager.set_item('face_detector_model', detector_model)
+	state_manager.set_item('face_detector_size', resolve_detector_size(detector_model, detector_size))
+	state_manager.set_item('face_detector_score', float(detector_score))
+	state_manager.set_item('face_detector_angles', [ int(angle) for angle in detector_angles ] or DEFAULT_DETECTOR_ANGLES)
+	face_detector.pre_check()
 
 
 def crop_face(vision_frame : VisionFrame, face : Face) -> VisionFrame:
@@ -229,12 +240,13 @@ def detect_faces_in_frame(vision_frame : VisionFrame) -> List[Dict[str, Any]]:
 	return [ { 'face': face, 'crop': crop_face(vision_frame, face) } for face in faces ]
 
 
-def detect_source_faces(files : Optional[List[File]]) -> Tuple[List[Dict[str, Any]], gradio.Markdown]:
+def detect_source_faces(files : Optional[List[File]], detector_model : str, detector_size : str, detector_score : float, detector_angles : List[int]) -> Tuple[List[Dict[str, Any]], gradio.Markdown]:
 	source_paths = filter_image_paths([ file.name for file in files ]) if files else []
 
 	if not source_paths:
 		return [], gradio.Markdown(value = 'Add source faces and a target image or video to begin.')
 
+	apply_detector_settings(detector_model, detector_size, detector_score, detector_angles)
 	source_items = []
 	for source_path in source_paths:
 		source_vision_frame = read_static_image(source_path)
@@ -247,29 +259,30 @@ def detect_source_faces(files : Optional[List[File]]) -> Tuple[List[Dict[str, An
 	return source_items, gradio.Markdown(value = '✅  Found ' + str(len(source_items)) + ' source face' + ('s' if len(source_items) != 1 else '') + '. Now match them to the target faces below.')
 
 
-def detect_target(file : Optional[File]) -> Tuple[Any, ...]:
+def detect_target(file : Optional[File], detector_model : str, detector_size : str, detector_score : float, detector_angles : List[int]) -> Tuple[Any, ...]:
 	target_path = file.name if file else None
 
 	if is_image(target_path):
+		apply_detector_settings(detector_model, detector_size, detector_score, detector_angles)
 		target_vision_frame = read_static_image(target_path)
 		target_items = with_default_assignment(detect_faces_in_frame(target_vision_frame))
-		status = target_status(target_items)
-		return target_items, target_vision_frame, target_path, False, 1, gradio.Slider(visible = False), gradio.Image(visible = False), status
+		return target_items, target_vision_frame, target_path, False, 1, gradio.Slider(visible = False), gradio.Image(visible = False), target_status(target_items)
 
 	if is_video(target_path):
+		apply_detector_settings(detector_model, detector_size, detector_score, detector_angles)
 		frame_total = max(1, count_video_frame_total(target_path))
 		target_vision_frame = read_video_frame(target_path, 1)
 		target_items = with_default_assignment(detect_faces_in_frame(target_vision_frame)) if target_vision_frame is not None else []
-		status = target_status(target_items, is_video = True)
-		return target_items, target_vision_frame, target_path, True, 1, gradio.Slider(minimum = 1, maximum = frame_total, value = 1, visible = True), gradio.Image(value = to_rgb(target_vision_frame), visible = True), status
+		return target_items, target_vision_frame, target_path, True, 1, gradio.Slider(minimum = 1, maximum = frame_total, value = 1, visible = True), gradio.Image(value = to_rgb(target_vision_frame), visible = True), target_status(target_items, is_video = True)
 
 	return [], None, None, False, 1, gradio.Slider(visible = False), gradio.Image(visible = False), gradio.Markdown(value = 'Add source faces and a target image or video to begin.')
 
 
-def select_frame(frame_number : int, target_path : Optional[str]) -> Tuple[Any, ...]:
+def select_frame(frame_number : int, target_path : Optional[str], detector_model : str, detector_size : str, detector_score : float, detector_angles : List[int]) -> Tuple[Any, ...]:
 	if not is_video(target_path):
 		return [], None, 1, gradio.Image(visible = False), gradio.Markdown(value = 'Drop a target video to scrub frames.')
 
+	apply_detector_settings(detector_model, detector_size, detector_score, detector_angles)
 	frame_number = int(frame_number)
 	target_vision_frame = read_video_frame(target_path, frame_number)
 	target_items = with_default_assignment(detect_faces_in_frame(target_vision_frame)) if target_vision_frame is not None else []
@@ -284,7 +297,7 @@ def with_default_assignment(target_items : List[Dict[str, Any]]) -> List[Dict[st
 
 def target_status(target_items : List[Dict[str, Any]], is_video : bool = False) -> gradio.Markdown:
 	if not target_items:
-		hint = ' Try another frame.' if is_video else ''
+		hint = ' Try another frame, or lower the detector score in Advanced.' if is_video else ' Try a clearer photo, or lower the detector score in Advanced.'
 		return gradio.Markdown(value = '❌  No face found in the target.' + hint)
 	return gradio.Markdown(value = '✅  Found ' + str(len(target_items)) + ' target face' + ('s' if len(target_items) != 1 else '') + '. Pick a source for each one below.')
 
@@ -314,15 +327,18 @@ def assign_source_at(target_index : int) -> Callable[[int, List[Dict[str, Any]]]
 	return assign
 
 
-def apply_best_settings(swap_area : str, do_enhance : bool) -> None:
+def apply_swap_settings(swap_area : str, do_enhance : bool, pixel_boost : str, swapper_weight : float, mask_blur : float, enhancer_blend : int) -> None:
 	area_options = SWAP_AREA_SET.get(swap_area, SWAP_AREA_SET.get('face'))
 	state_manager.set_item('face_swapper_model', area_options.get('model'))
-	state_manager.set_item('face_swapper_pixel_boost', area_options.get('pixel_boost'))
+	state_manager.set_item('face_swapper_pixel_boost', pixel_boost)
+	state_manager.set_item('face_swapper_weight', float(swapper_weight))
 	state_manager.set_item('face_mask_types', area_options.get('mask_types'))
 	state_manager.set_item('face_mask_padding', [ 0, 0, 0, 0 ])
+	state_manager.set_item('face_mask_blur', float(mask_blur))
 
 	if do_enhance:
 		state_manager.set_item('face_enhancer_model', FACE_ENHANCER_MODEL)
+		state_manager.set_item('face_enhancer_blend', int(enhancer_blend))
 
 
 def prepare_models(do_enhance : bool) -> bool:
@@ -373,7 +389,7 @@ def swap_frame_by_match(vision_frame : VisionFrame, source_items : List[Dict[str
 	return vision_frame
 
 
-def swap(source_items : List[Dict[str, Any]], target_items : List[Dict[str, Any]], target_vision_frame : Optional[VisionFrame], target_path : Optional[str], is_target_video : bool, reference_frame : int, swap_area : str, do_enhance : bool):
+def swap(source_items : List[Dict[str, Any]], target_items : List[Dict[str, Any]], target_vision_frame : Optional[VisionFrame], target_path : Optional[str], is_target_video : bool, reference_frame : int, swap_area : str, do_enhance : bool, detector_model : str, detector_size : str, detector_score : float, detector_angles : List[int], pixel_boost : str, swapper_weight : float, mask_blur : float, enhancer_blend : int):
 	hidden_image = gradio.Image(visible = False)
 	hidden_video = gradio.Video(visible = False)
 
@@ -388,7 +404,8 @@ def swap(source_items : List[Dict[str, Any]], target_items : List[Dict[str, Any]
 		return
 
 	yield hidden_image, hidden_video, '⏳  Preparing models (first run downloads them, please wait)…'
-	apply_best_settings(swap_area, do_enhance)
+	apply_detector_settings(detector_model, detector_size, detector_score, detector_angles)
+	apply_swap_settings(swap_area, do_enhance, pixel_boost, swapper_weight, mask_blur, enhancer_blend)
 	if not prepare_models(do_enhance):
 		yield hidden_image, hidden_video, '❌  Could not prepare the required models. Check your connection and try again.'
 		return
@@ -397,7 +414,6 @@ def swap(source_items : List[Dict[str, Any]], target_items : List[Dict[str, Any]
 		yield from swap_video(source_items, target_items, target_path, do_enhance)
 		return
 
-	# image target
 	pairs = collect_pairs(source_items, target_items)
 	result_vision_frame = target_vision_frame.copy()
 	for order, (source_index, target_index) in enumerate(pairs):
