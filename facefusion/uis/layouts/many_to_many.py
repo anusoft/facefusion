@@ -4,7 +4,7 @@ from typing import List, Optional, Tuple
 
 import gradio
 
-import facefusion.processors.modules.face_swapper as face_swapper
+import facefusion.processors.modules.face_swapper.core as face_swapper
 from facefusion import face_classifier, face_detector, face_landmarker, face_masker, face_recognizer, state_manager
 from facefusion.common_helper import get_first
 from facefusion.face_analyser import get_average_face, get_many_faces
