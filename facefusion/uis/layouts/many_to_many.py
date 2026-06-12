@@ -31,8 +31,15 @@ from facefusion.vision import read_static_image, write_image
 # look, which is the single biggest quality win.
 #
 
-FACE_SWAPPER_MODEL = 'inswapper_128'
-FACE_SWAPPER_PIXEL_BOOST = '256x256'
+# 'face'  -> inswapper_128 (arcface crop): sharpest identity, eyebrows-to-chin.
+# 'wide'  -> hififace_unofficial_256 (mtcnn_512 crop): covers forehead + jaw up
+#            to the hairline, the closest to a whole-head look these models can
+#            do. Note: NONE of the swapper models can replace the source's hair.
+SWAP_AREA_SET =\
+{
+	'face': { 'model': 'inswapper_128', 'pixel_boost': '256x256', 'mask_types': [ 'box', 'occlusion' ] },
+	'wide': { 'model': 'hififace_unofficial_256', 'pixel_boost': '256x256', 'mask_types': [ 'box' ] }
+}
 FACE_ENHANCER_MODEL = 'gfpgan_1.4'
 KEEP_ORIGINAL = -1
 
@@ -48,6 +55,7 @@ MANY_TO_MANY_CSS =\
 
 SOURCE_FILE : Optional[gradio.File] = None
 TARGET_FILE : Optional[gradio.Image] = None
+SWAP_AREA_RADIO : Optional[gradio.Radio] = None
 ENHANCE_CHECKBOX : Optional[gradio.Checkbox] = None
 SWAP_BUTTON : Optional[gradio.Button] = None
 CLEAR_BUTTON : Optional[gradio.Button] = None
@@ -64,7 +72,7 @@ def pre_check() -> bool:
 
 
 def render() -> gradio.Blocks:
-	global SOURCE_FILE, TARGET_FILE, ENHANCE_CHECKBOX, SWAP_BUTTON, CLEAR_BUTTON, RESULT_IMAGE, STATUS_MARKDOWN
+	global SOURCE_FILE, TARGET_FILE, SWAP_AREA_RADIO, ENHANCE_CHECKBOX, SWAP_BUTTON, CLEAR_BUTTON, RESULT_IMAGE, STATUS_MARKDOWN
 	global SOURCE_FACES_STATE, TARGET_FACES_STATE, TARGET_FRAME_STATE
 
 	with gradio.Blocks() as layout:
@@ -91,6 +99,11 @@ def render() -> gradio.Blocks:
 		gradio.Markdown('### 3.  Match each target face to a source')
 		render_target_matcher()
 
+		SWAP_AREA_RADIO = gradio.Radio(
+			label = 'Swap area  (hair is always kept from the target — these models can\'t replace hair)',
+			choices = [ ('Face — sharpest match (eyebrows to chin)', 'face'), ('Wide — forehead + jaw, up to the hairline', 'wide') ],
+			value = 'face'
+		)
 		ENHANCE_CHECKBOX = gradio.Checkbox(
 			label = 'Enhance faces after swapping (GFPGAN) — recommended',
 			value = True
@@ -177,7 +190,7 @@ def render_target_matcher() -> None:
 def listen() -> None:
 	SOURCE_FILE.change(detect_source_faces, inputs = SOURCE_FILE, outputs = [ SOURCE_FACES_STATE, STATUS_MARKDOWN ])
 	TARGET_FILE.change(detect_target_faces, inputs = TARGET_FILE, outputs = [ TARGET_FACES_STATE, TARGET_FRAME_STATE, STATUS_MARKDOWN ])
-	SWAP_BUTTON.click(swap_matched_faces, inputs = [ SOURCE_FACES_STATE, TARGET_FACES_STATE, TARGET_FRAME_STATE, ENHANCE_CHECKBOX ], outputs = [ RESULT_IMAGE, STATUS_MARKDOWN ])
+	SWAP_BUTTON.click(swap_matched_faces, inputs = [ SOURCE_FACES_STATE, TARGET_FACES_STATE, TARGET_FRAME_STATE, SWAP_AREA_RADIO, ENHANCE_CHECKBOX ], outputs = [ RESULT_IMAGE, STATUS_MARKDOWN ])
 	CLEAR_BUTTON.click(clear, outputs = [ SOURCE_FILE, TARGET_FILE, RESULT_IMAGE, STATUS_MARKDOWN, SOURCE_FACES_STATE, TARGET_FACES_STATE, TARGET_FRAME_STATE ])
 
 
@@ -257,21 +270,17 @@ def assign_source_at(target_index : int) -> Callable[[int, List[Dict[str, Any]]]
 	return assign
 
 
-def apply_best_settings(do_enhance : bool) -> None:
-	state_manager.set_item('face_swapper_model', FACE_SWAPPER_MODEL)
-	state_manager.set_item('face_swapper_pixel_boost', FACE_SWAPPER_PIXEL_BOOST)
+def apply_best_settings(swap_area : str, do_enhance : bool) -> None:
+	area_options = SWAP_AREA_SET.get(swap_area, SWAP_AREA_SET.get('face'))
+	state_manager.set_item('face_swapper_model', area_options.get('model'))
+	state_manager.set_item('face_swapper_pixel_boost', area_options.get('pixel_boost'))
+	# 'wide' uses box only so the swap reaches the forehead/jaw without occlusion
+	# carving it back to the inner face; 'face' adds occlusion for clean overlaps.
+	state_manager.set_item('face_mask_types', area_options.get('mask_types'))
+	state_manager.set_item('face_mask_padding', [ 0, 0, 0, 0 ])
 
 	if do_enhance:
 		state_manager.set_item('face_enhancer_model', FACE_ENHANCER_MODEL)
-
-	# box keeps the swap inside the face, occlusion lets hair / hands / other
-	# faces in a busy group photo correctly cover the swapped region.
-	face_mask_types = state_manager.get_item('face_mask_types') or []
-	best_mask_types = list(face_mask_types)
-	for mask_type in [ 'box', 'occlusion' ]:
-		if mask_type not in best_mask_types:
-			best_mask_types.append(mask_type)
-	state_manager.set_item('face_mask_types', best_mask_types)
 
 
 def prepare_models(do_enhance : bool) -> bool:
@@ -309,7 +318,7 @@ def collect_pairs(source_items : List[Dict[str, Any]], target_items : List[Dict[
 	return pairs
 
 
-def swap_matched_faces(source_items : List[Dict[str, Any]], target_items : List[Dict[str, Any]], target_vision_frame : Optional[VisionFrame], do_enhance : bool):
+def swap_matched_faces(source_items : List[Dict[str, Any]], target_items : List[Dict[str, Any]], target_vision_frame : Optional[VisionFrame], swap_area : str, do_enhance : bool):
 	if not source_items:
 		yield None, '⚠️  Add at least one source face.'
 		return
@@ -323,7 +332,7 @@ def swap_matched_faces(source_items : List[Dict[str, Any]], target_items : List[
 		return
 
 	yield None, '⏳  Preparing models (first run downloads them, please wait)…'
-	apply_best_settings(do_enhance)
+	apply_best_settings(swap_area, do_enhance)
 	if not prepare_models(do_enhance):
 		yield None, '❌  Could not prepare the required models. Check your connection and try again.'
 		return
