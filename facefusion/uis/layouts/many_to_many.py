@@ -20,11 +20,11 @@ from facefusion.vision import read_static_image, write_image
 # A simplified, dedicated page for swapping MANY faces onto MANY faces.
 #
 # Flow:
-#   1. Drop source photo(s) -> every face found is shown with a Remove button.
-#   2. Drop the target photo -> every face found is shown with a Remove button.
-#   3. Remove any face you don't want on either side.
-#   4. Click "Match all faces" -> source face #1 -> target face #1, #2 -> #2 ...
-#      (both sides ordered left-to-right) then swap and clean up.
+#   1. Drop source photo(s) -> each detected face becomes "Source 1, 2, 3 ...".
+#   2. Drop the target photo -> each detected face is shown with a dropdown.
+#   3. For every target face, pick which source replaces it (auto-matched by
+#      order, change any you like, or keep the original).
+#   4. Click "Swap faces".
 #
 # Quality choices (research backed): inswapper_128 gives the best identity
 # fidelity, and a GFPGAN face-enhancer pass removes the low-resolution "swapped"
@@ -34,6 +34,7 @@ from facefusion.vision import read_static_image, write_image
 FACE_SWAPPER_MODEL = 'inswapper_128'
 FACE_SWAPPER_PIXEL_BOOST = '256x256'
 FACE_ENHANCER_MODEL = 'gfpgan_1.4'
+KEEP_ORIGINAL = -1
 
 MANY_TO_MANY_CSS =\
 '''
@@ -48,7 +49,7 @@ MANY_TO_MANY_CSS =\
 SOURCE_FILE : Optional[gradio.File] = None
 TARGET_FILE : Optional[gradio.Image] = None
 ENHANCE_CHECKBOX : Optional[gradio.Checkbox] = None
-MATCH_BUTTON : Optional[gradio.Button] = None
+SWAP_BUTTON : Optional[gradio.Button] = None
 CLEAR_BUTTON : Optional[gradio.Button] = None
 RESULT_IMAGE : Optional[gradio.Image] = None
 STATUS_MARKDOWN : Optional[gradio.Markdown] = None
@@ -63,11 +64,11 @@ def pre_check() -> bool:
 
 
 def render() -> gradio.Blocks:
-	global SOURCE_FILE, TARGET_FILE, ENHANCE_CHECKBOX, MATCH_BUTTON, CLEAR_BUTTON, RESULT_IMAGE, STATUS_MARKDOWN
+	global SOURCE_FILE, TARGET_FILE, ENHANCE_CHECKBOX, SWAP_BUTTON, CLEAR_BUTTON, RESULT_IMAGE, STATUS_MARKDOWN
 	global SOURCE_FACES_STATE, TARGET_FACES_STATE, TARGET_FRAME_STATE
 
 	with gradio.Blocks() as layout:
-		gradio.HTML('<style>' + MANY_TO_MANY_CSS + '</style><div class="m2m-hero"><h1>Multi-Face Swap</h1><p>Drop your faces and a target photo, remove the ones you don\'t want, then match everyone in one click.</p></div>')
+		gradio.HTML('<style>' + MANY_TO_MANY_CSS + '</style><div class="m2m-hero"><h1>Multi-Face Swap</h1><p>Add your source faces, drop a target photo, then pick which source replaces each target face.</p></div>')
 
 		SOURCE_FACES_STATE = gradio.State([])
 		TARGET_FACES_STATE = gradio.State([])
@@ -80,21 +81,23 @@ def render() -> gradio.Blocks:
 					file_count = 'multiple',
 					file_types = [ 'image' ]
 				)
-				render_face_cards(SOURCE_FACES_STATE, 'Source', remove_source_face_at)
+				render_source_palette()
 			with gradio.Column():
 				TARGET_FILE = gradio.Image(
 					label = '2.  Target photo  —  the faces to replace',
 					type = 'filepath'
 				)
-				render_face_cards(TARGET_FACES_STATE, 'Face', remove_target_face_at)
+
+		gradio.Markdown('### 3.  Match each target face to a source')
+		render_target_matcher()
 
 		ENHANCE_CHECKBOX = gradio.Checkbox(
 			label = 'Enhance faces after swapping (GFPGAN) — recommended',
 			value = True
 		)
 		with gradio.Row():
-			MATCH_BUTTON = gradio.Button(
-				value = 'Match all faces',
+			SWAP_BUTTON = gradio.Button(
+				value = 'Swap faces',
 				variant = 'primary',
 				size = 'lg',
 				elem_classes = 'm2m-swap-button'
@@ -104,7 +107,7 @@ def render() -> gradio.Blocks:
 				size = 'lg'
 			)
 		STATUS_MARKDOWN = gradio.Markdown(
-			value = 'Drop source faces and a target photo to begin.',
+			value = 'Add source faces and a target photo to begin.',
 			elem_classes = 'm2m-status'
 		)
 		RESULT_IMAGE = gradio.Image(
@@ -114,18 +117,18 @@ def render() -> gradio.Blocks:
 	return layout
 
 
-def render_face_cards(faces_state : gradio.State, label_prefix : str, remover_factory : Callable[[int], Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]]) -> None:
-	@gradio.render(inputs = faces_state)
-	def render_cards(face_items : List[Dict[str, Any]]) -> None:
-		if not face_items:
-			gradio.Markdown('*No ' + label_prefix.lower() + ' faces yet.*')
+def render_source_palette() -> None:
+	@gradio.render(inputs = SOURCE_FACES_STATE)
+	def render_palette(source_items : List[Dict[str, Any]]) -> None:
+		if not source_items:
+			gradio.Markdown('*No source faces yet — drop photo(s) above.*')
 			return
 
 		with gradio.Row():
-			for index, face_item in enumerate(face_items):
+			for index, source_item in enumerate(source_items):
 				with gradio.Column(min_width = 116):
 					gradio.Image(
-						value = face_item.get('crop'),
+						value = source_item.get('crop'),
 						height = 116,
 						show_label = False,
 						interactive = False,
@@ -133,14 +136,48 @@ def render_face_cards(faces_state : gradio.State, label_prefix : str, remover_fa
 						show_fullscreen_button = False,
 						elem_classes = 'm2m-face-card'
 					)
-					remove_button = gradio.Button(value = '✕ ' + label_prefix + ' ' + str(index + 1), size = 'sm')
-					remove_button.click(remover_factory(index), inputs = faces_state, outputs = faces_state)
+					remove_button = gradio.Button(value = '✕ Source ' + str(index + 1), size = 'sm')
+					remove_button.click(remove_source_at(index), inputs = SOURCE_FACES_STATE, outputs = SOURCE_FACES_STATE)
+
+
+def render_target_matcher() -> None:
+	@gradio.render(inputs = [ SOURCE_FACES_STATE, TARGET_FACES_STATE ])
+	def render_matcher(source_items : List[Dict[str, Any]], target_items : List[Dict[str, Any]]) -> None:
+		if not target_items:
+			gradio.Markdown('*No target faces yet — drop a target photo above.*')
+			return
+
+		source_choices = [ ('— keep original —', KEEP_ORIGINAL) ] + [ ('Source ' + str(index + 1), index) for index in range(len(source_items)) ]
+
+		with gradio.Row():
+			for target_index, target_item in enumerate(target_items):
+				selected_source = target_item.get('source_index', KEEP_ORIGINAL)
+				if selected_source >= len(source_items):
+					selected_source = KEEP_ORIGINAL
+
+				with gradio.Column(min_width = 150):
+					gradio.Image(
+						value = target_item.get('crop'),
+						height = 116,
+						show_label = False,
+						interactive = False,
+						show_download_button = False,
+						show_fullscreen_button = False,
+						elem_classes = 'm2m-face-card'
+					)
+					source_dropdown = gradio.Dropdown(
+						label = 'Target ' + str(target_index + 1) + ' → replace with',
+						choices = source_choices,
+						value = selected_source,
+						container = True
+					)
+					source_dropdown.change(assign_source_at(target_index), inputs = [ source_dropdown, TARGET_FACES_STATE ], outputs = TARGET_FACES_STATE)
 
 
 def listen() -> None:
 	SOURCE_FILE.change(detect_source_faces, inputs = SOURCE_FILE, outputs = [ SOURCE_FACES_STATE, STATUS_MARKDOWN ])
 	TARGET_FILE.change(detect_target_faces, inputs = TARGET_FILE, outputs = [ TARGET_FACES_STATE, TARGET_FRAME_STATE, STATUS_MARKDOWN ])
-	MATCH_BUTTON.click(match_and_swap, inputs = [ SOURCE_FACES_STATE, TARGET_FACES_STATE, TARGET_FRAME_STATE, ENHANCE_CHECKBOX ], outputs = [ RESULT_IMAGE, STATUS_MARKDOWN ])
+	SWAP_BUTTON.click(swap_matched_faces, inputs = [ SOURCE_FACES_STATE, TARGET_FACES_STATE, TARGET_FRAME_STATE, ENHANCE_CHECKBOX ], outputs = [ RESULT_IMAGE, STATUS_MARKDOWN ])
 	CLEAR_BUTTON.click(clear, outputs = [ SOURCE_FILE, TARGET_FILE, RESULT_IMAGE, STATUS_MARKDOWN, SOURCE_FACES_STATE, TARGET_FACES_STATE, TARGET_FRAME_STATE ])
 
 
@@ -171,44 +208,53 @@ def detect_source_faces(files : Optional[List[File]]) -> Tuple[List[Dict[str, An
 	source_paths = filter_image_paths([ file.name for file in files ]) if files else []
 
 	if not source_paths:
-		return [], gradio.Markdown(value = 'Drop source faces and a target photo to begin.')
+		return [], gradio.Markdown(value = 'Add source faces and a target photo to begin.')
 
-	face_items = []
+	source_items = []
 	for source_path in source_paths:
 		source_vision_frame = read_static_image(source_path)
-		for face_item in detect_faces_in_frame(source_vision_frame):
-			face_item['face'] = get_average_face([ face_item['face'] ])
-			face_items.append(face_item)
+		for source_item in detect_faces_in_frame(source_vision_frame):
+			source_item['face'] = get_average_face([ source_item['face'] ])
+			source_items.append(source_item)
 
-	if not face_items:
+	if not source_items:
 		return [], gradio.Markdown(value = '❌  No face found in the source photos. Use clearer portraits.')
-	return face_items, gradio.Markdown(value = '✅  Found ' + str(len(face_items)) + ' source face' + ('s' if len(face_items) != 1 else '') + '. Remove any you don\'t want.')
+	return source_items, gradio.Markdown(value = '✅  Found ' + str(len(source_items)) + ' source face' + ('s' if len(source_items) != 1 else '') + '. Now match them to the target faces below.')
 
 
 def detect_target_faces(target_path : Optional[str]) -> Tuple[List[Dict[str, Any]], Optional[VisionFrame], gradio.Markdown]:
 	if not is_image(target_path):
-		return [], None, gradio.Markdown(value = 'Drop source faces and a target photo to begin.')
+		return [], None, gradio.Markdown(value = 'Add source faces and a target photo to begin.')
 
 	target_vision_frame = read_static_image(target_path)
-	face_items = detect_faces_in_frame(target_vision_frame)
+	target_items = detect_faces_in_frame(target_vision_frame)
 
-	if not face_items:
+	# auto-match each target face to the source at the same position
+	for target_index, target_item in enumerate(target_items):
+		target_item['source_index'] = target_index
+
+	if not target_items:
 		return [], None, gradio.Markdown(value = '❌  No face found in the target photo.')
-	return face_items, target_vision_frame, gradio.Markdown(value = '✅  Found ' + str(len(face_items)) + ' target face' + ('s' if len(face_items) != 1 else '') + '. Remove any you don\'t want.')
+	return target_items, target_vision_frame, gradio.Markdown(value = '✅  Found ' + str(len(target_items)) + ' target face' + ('s' if len(target_items) != 1 else '') + '. Pick a source for each one below.')
 
 
-def remove_source_face_at(target_index : int) -> Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]:
-	return lambda face_items : remove_face_item(face_items, target_index)
+def remove_source_at(target_index : int) -> Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]:
+	def remove(source_items : List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+		if source_items and 0 <= target_index < len(source_items):
+			return [ source_item for index, source_item in enumerate(source_items) if index != target_index ]
+		return source_items
+	return remove
 
 
-def remove_target_face_at(target_index : int) -> Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]:
-	return lambda face_items : remove_face_item(face_items, target_index)
-
-
-def remove_face_item(face_items : List[Dict[str, Any]], target_index : int) -> List[Dict[str, Any]]:
-	if face_items and 0 <= target_index < len(face_items):
-		return [ face_item for index, face_item in enumerate(face_items) if index != target_index ]
-	return face_items
+def assign_source_at(target_index : int) -> Callable[[int, List[Dict[str, Any]]], List[Dict[str, Any]]]:
+	def assign(source_index : int, target_items : List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+		target_items = list(target_items)
+		if 0 <= target_index < len(target_items):
+			updated_item = dict(target_items[target_index])
+			updated_item['source_index'] = source_index
+			target_items[target_index] = updated_item
+		return target_items
+	return assign
 
 
 def apply_best_settings(do_enhance : bool) -> None:
@@ -253,12 +299,27 @@ def enhance_faces(vision_frame : VisionFrame) -> VisionFrame:
 	return vision_frame
 
 
-def match_and_swap(source_items : List[Dict[str, Any]], target_items : List[Dict[str, Any]], target_vision_frame : Optional[VisionFrame], do_enhance : bool):
+def collect_pairs(source_items : List[Dict[str, Any]], target_items : List[Dict[str, Any]]) -> List[Tuple[int, int]]:
+	pairs = []
+
+	for target_index, target_item in enumerate(target_items):
+		source_index = target_item.get('source_index', KEEP_ORIGINAL)
+		if source_index is not None and 0 <= source_index < len(source_items):
+			pairs.append((source_index, target_index))
+	return pairs
+
+
+def swap_matched_faces(source_items : List[Dict[str, Any]], target_items : List[Dict[str, Any]], target_vision_frame : Optional[VisionFrame], do_enhance : bool):
 	if not source_items:
 		yield None, '⚠️  Add at least one source face.'
 		return
 	if not target_items or target_vision_frame is None:
 		yield None, '⚠️  Add a target photo with at least one face.'
+		return
+
+	pairs = collect_pairs(source_items, target_items)
+	if not pairs:
+		yield None, '⚠️  Pick a source for at least one target face.'
 		return
 
 	yield None, '⏳  Preparing models (first run downloads them, please wait)…'
@@ -267,12 +328,10 @@ def match_and_swap(source_items : List[Dict[str, Any]], target_items : List[Dict
 		yield None, '❌  Could not prepare the required models. Check your connection and try again.'
 		return
 
-	swap_total = min(len(source_items), len(target_items))
 	result_vision_frame = target_vision_frame.copy()
-
-	for index in range(swap_total):
-		yield None, '✨  Swapping face ' + str(index + 1) + ' of ' + str(swap_total) + '…'
-		result_vision_frame = face_swapper.swap_face(source_items[index]['face'], target_items[index]['face'], result_vision_frame)
+	for order, (source_index, target_index) in enumerate(pairs):
+		yield None, '✨  Swapping face ' + str(order + 1) + ' of ' + str(len(pairs)) + '…'
+		result_vision_frame = face_swapper.swap_face(source_items[source_index]['face'], target_items[target_index]['face'], result_vision_frame)
 
 	if do_enhance:
 		yield None, '🎨  Enhancing faces…'
@@ -282,17 +341,7 @@ def match_and_swap(source_items : List[Dict[str, Any]], target_items : List[Dict
 	write_image(output_path, result_vision_frame)
 	clear_static_faces()
 
-	yield output_path, build_summary(len(source_items), len(target_items), swap_total)
-
-
-def build_summary(source_total : int, target_total : int, swap_total : int) -> str:
-	summary = '✅  Matched and swapped ' + str(swap_total) + ' face' + ('s' if swap_total != 1 else '') + ', left to right.'
-
-	if target_total > swap_total:
-		summary += '  ' + str(target_total - swap_total) + ' target face' + ('s' if target_total - swap_total != 1 else '') + ' had no source and stayed unchanged.'
-	if source_total > swap_total:
-		summary += '  ' + str(source_total - swap_total) + ' source face' + ('s' if source_total - swap_total != 1 else '') + ' went unused.'
-	return summary
+	yield output_path, '✅  Swapped ' + str(len(pairs)) + ' face' + ('s' if len(pairs) != 1 else '') + '.'
 
 
 def resolve_output_path() -> str:
@@ -309,7 +358,7 @@ def clear() -> Tuple[Any, ...]:
 		gradio.File(value = None),
 		gradio.Image(value = None),
 		gradio.Image(value = None),
-		gradio.Markdown(value = 'Drop source faces and a target photo to begin.'),
+		gradio.Markdown(value = 'Add source faces and a target photo to begin.'),
 		[],
 		[],
 		None
